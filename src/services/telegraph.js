@@ -1,72 +1,79 @@
-const axios = require('axios');
+const fetch    = require('node-fetch');
 const FormData = require('form-data');
-const config = require('../../config');
+const axios    = require('axios');
+const config   = require('../../config');
 
-const TELEGRAPH_API = config.telegraph.apiUrl;
-const ACCESS_TOKEN = config.telegraph.accessToken;
+const TELEGRAPH_API  = config.telegraph.apiUrl;
+const ACCESS_TOKEN   = config.telegraph.accessToken;
 
-// Telegraph only accepts: image/jpeg, image/png, image/gif, video/mp4
-const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4'];
+// Telegraph only accepts these exact mime types on /upload
+// Everything else must be linked, not uploaded
+const UPLOADABLE = {
+  'image/jpeg': { ext: 'jpg',  mime: 'image/jpeg' },
+  'image/png':  { ext: 'png',  mime: 'image/png'  },
+  'image/gif':  { ext: 'gif',  mime: 'image/gif'  },
+  'image/webp': { ext: 'jpg',  mime: 'image/jpeg' }, // re-label
+  'video/mp4':  { ext: 'mp4',  mime: 'video/mp4'  },
+  'video/webm': { ext: 'mp4',  mime: 'video/mp4'  }, // re-label
+};
 
-function mimeTypeToExt(mimeType) {
-  const map = {
-    'image/jpeg': 'jpg',
-    'image/png':  'png',
-    'image/gif':  'gif',
-    'image/webp': 'jpg',   // webp → re-label as jpg (telegraph accepts it)
-    'video/mp4':  'mp4',
-    'video/webm': 'mp4',   // re-label webm as mp4
-    'audio/mpeg': 'mp3',
-    'audio/ogg':  'ogg',
-    'audio/mp4':  'm4a',
-  };
-  return map[mimeType] || 'jpg';
+function canUpload(mimeType) {
+  return !!(UPLOADABLE[mimeType]);
 }
 
-// Normalize mime for Telegraph's strict whitelist
-function normalizeMime(mimeType) {
-  if (!mimeType) return 'image/jpeg';
-  if (mimeType.startsWith('image/')) return 'image/jpeg';
-  if (mimeType.startsWith('video/')) return 'video/mp4';
-  return null; // not uploadable to telegraph directly
-}
-
+// Core upload — uses node-fetch to stream form-data correctly
 async function uploadFile(fileBuffer, mimeType) {
-  const normalized = normalizeMime(mimeType);
-  if (!normalized) {
-    throw new Error('UNSUPPORTED_MIME:' + mimeType);
+  const spec = UPLOADABLE[mimeType];
+  if (!spec) {
+    throw new Error(`ᴛᴇʟᴇɢʀᴀᴘʜ ᴅᴏᴇs ɴᴏᴛ sᴜᴘᴘᴏʀᴛ ᴜᴘʟᴏᴀᴅɪɴɢ: ${mimeType}`);
   }
 
-  const ext = mimeTypeToExt(mimeType);
+  // 5 MB hard limit on Telegraph /upload
+  const MAX = 5 * 1024 * 1024;
+  if (fileBuffer.length > MAX) {
+    throw new Error(`ғɪʟᴇ ᴛᴏᴏ ʟᴀʀɢᴇ ғᴏʀ ᴛᴇʟᴇɢʀᴀᴘʜ (ᴍᴀx 5 ᴍʙ). sɪᴢᴇ: ${(fileBuffer.length/1024/1024).toFixed(1)} ᴍʙ`);
+  }
+
   const form = new FormData();
   form.append('file', fileBuffer, {
-    filename: `upload.${ext}`,
-    contentType: normalized,   // always send normalized mime
+    filename:    `file.${spec.ext}`,
+    contentType: spec.mime,
+    knownLength: fileBuffer.length,
   });
 
-  let response;
-  try {
-    response = await axios.post('https://telegra.ph/upload', form, {
-      headers: form.getHeaders(),
-      maxContentLength: 50 * 1024 * 1024,
-      maxBodyLength:    50 * 1024 * 1024,
-      timeout: 60000,
-    });
-  } catch (err) {
-    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    throw new Error('Telegraph upload HTTP error: ' + detail);
+  const res = await fetch('https://telegra.ph/upload', {
+    method:  'POST',
+    body:    form,
+    headers: form.getHeaders(),
+    timeout: 30000,
+  });
+
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Telegraph /upload ${res.status}: ${text}`);
   }
 
-  if (Array.isArray(response.data) && response.data[0]?.src) {
-    return 'https://telegra.ph' + response.data[0].src;
+  let json;
+  try { json = JSON.parse(text); } catch {
+    throw new Error('Telegraph /upload bad JSON: ' + text);
   }
-  throw new Error('Telegraph upload bad response: ' + JSON.stringify(response.data));
+
+  if (json.error) throw new Error('Telegraph /upload error: ' + json.error);
+
+  if (Array.isArray(json) && json[0]?.src) {
+    return 'https://telegra.ph' + json[0].src;
+  }
+
+  throw new Error('Telegraph /upload unexpected response: ' + text);
 }
+
+// ── Content node builders ─────────────────────────────────
 
 function tagNode(tag, attrs, children) {
   const node = { tag };
-  if (attrs && Object.keys(attrs).length) node.attrs = attrs;
-  if (children && children.length) node.children = children;
+  if (attrs  && Object.keys(attrs).length)    node.attrs    = attrs;
+  if (children && children.length)             node.children = children;
   return node;
 }
 
@@ -82,10 +89,10 @@ function videoNode(src, caption) {
   return fig;
 }
 
-function audioNode(telegramFileUrl, label) {
-  // Audio cannot be uploaded to Telegraph - embed as a link
+// Audio/docs can't be hosted on Telegraph — embed as hyperlink
+function audioNode(href, label) {
   return tagNode('p', {}, [
-    tagNode('a', { href: telegramFileUrl }, [label || 'audio file']),
+    tagNode('a', { href }, [`[ ${label || 'audio'} ]`]),
   ]);
 }
 
@@ -95,11 +102,13 @@ function documentNode(href, filename) {
   ]);
 }
 
+// ── Telegraph API calls ───────────────────────────────────
+
 async function createPage(title, content) {
   const payload = {
-    access_token: ACCESS_TOKEN,
-    title,
-    content: JSON.stringify(content),
+    access_token:   ACCESS_TOKEN,
+    title:          title.slice(0, 256),   // Telegraph max title length
+    content:        JSON.stringify(content),
     return_content: false,
   };
   if (config.telegraph.authorName) payload.author_name = config.telegraph.authorName;
@@ -109,20 +118,10 @@ async function createPage(title, content) {
   try {
     res = await axios.post(`${TELEGRAPH_API}/createPage`, payload, { timeout: 15000 });
   } catch (err) {
-    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    throw new Error('createPage HTTP error: ' + detail);
+    throw new Error('createPage: ' + (err.response?.data ? JSON.stringify(err.response.data) : err.message));
   }
 
-  if (!res.data.ok) throw new Error('createPage failed: ' + res.data.error);
-  return res.data.result;
-}
-
-async function getPage(path) {
-  const res = await axios.get(`${TELEGRAPH_API}/getPage/${path}`, {
-    params: { return_content: false },
-    timeout: 10000,
-  });
-  if (!res.data.ok) throw new Error('getPage failed: ' + res.data.error);
+  if (!res.data.ok) throw new Error('createPage: ' + res.data.error);
   return res.data.result;
 }
 
@@ -134,7 +133,7 @@ async function getAccountInfo() {
     },
     timeout: 10000,
   });
-  if (!res.data.ok) throw new Error('getAccountInfo failed: ' + res.data.error);
+  if (!res.data.ok) throw new Error('getAccountInfo: ' + res.data.error);
   return res.data.result;
 }
 
@@ -143,19 +142,19 @@ async function getPageList(offset = 0, limit = 50) {
     params: { access_token: ACCESS_TOKEN, offset, limit },
     timeout: 10000,
   });
-  if (!res.data.ok) throw new Error('getPageList failed: ' + res.data.error);
+  if (!res.data.ok) throw new Error('getPageList: ' + res.data.error);
   return res.data.result;
 }
 
 module.exports = {
   uploadFile,
+  canUpload,
   tagNode,
   imageNode,
   videoNode,
   audioNode,
   documentNode,
   createPage,
-  getPage,
   getAccountInfo,
   getPageList,
 };
